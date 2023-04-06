@@ -25,32 +25,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Log in to registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Build and push container image
+      - name: Gather context
+        id: ctx
         run: |
-          # Image name may contain only lowercase letters
-          IMAGE_ID=$(echo ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} | tr '[A-Z]' '[a-z]')
+          echo is_release=${{ contains(github.ref, 'refs/tags/') }} | tee -a $GITHUB_OUTPUT
+          echo is_dev=${{ ! contains(github.ref, 'refs/tags/') }} | tee -a $GITHUB_OUTPUT
+          echo version=$(git describe --always) | tee -a $GITHUB_OUTPUT
 
-          # Strip git ref prefix from version
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-          # If not tag, then use `develop` as image tag
-          [ "$VERSION" == main ] && VERSION=develop
+      # QEMU is used to set up VMs for building non-x86_64 images.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: "arm,arm64"
 
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
+      # This is required to build multi-arch images.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-          docker build . --file container/Dockerfile \
-              --build-arg "CREATED=$(date --rfc-3339=seconds)" \
-              --build-arg "VERSION=$(git describe --always)" \
-              --build-arg "COMMIT=$(git rev-parse -q --verify HEAD^{commit})" \
-              --tag $IMAGE_ID:$VERSION
+      - name: Log in to registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-          docker push $IMAGE_ID:$VERSION
+      - name: Configure metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Configure to use `latest` and the PEP440 version from a tag name for
+          # releases, and `develop` for non-release main builds.
+          tags: |
+            type=pep440,pattern={{ version }},enable=${{ steps.ctx.outputs.is_release }}
+            type=raw,value=latest,enable=${{ steps.ctx.outputs.is_release }}
+            type=raw,value=develop,enable=${{ steps.ctx.outputs.is_dev }}
+          labels: |
+            org.opencontainers.image.authors=opensource@aiven.io
+            org.opencontainers.image.url=https://karapace.io
+            org.opencontainers.image.documentation=https://github.com/aiven/karapace/
+            org.opencontainers.image.vendor=Aiven
+            org.opencontainers.image.licenses=Apache-2.0
 
-          if [[ "${{ github.ref }}" == "refs/tags/"* ]];
-          then
-            docker tag $IMAGE_ID:$VERSION $IMAGE_ID:latest
-            docker push $IMAGE_ID:latest
-          fi
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            KARAPACE_VERSION=${{ steps.ctx.outputs.version }}
+          file: container/Dockerfile
+          platforms: "linux/amd64,linux/arm64"
